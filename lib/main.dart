@@ -1,42 +1,322 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 
-import 'package:background_fetch/background_fetch.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:logger/logger.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:pedometer/pedometer.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-const MethodChannel platform = MethodChannel('step_counter');
-var logger = Logger();
+void main() => runApp(const ExampleApp());
 
-int countFinal = 0;
-
+// The callback function should always be a top-level function.
 @pragma('vm:entry-point')
-void backgroundFetchHeadlessTask(HeadlessTask task) async {
-  var taskId = task.taskId;
-  var timeout = task.timeout;
-  if (timeout) {
-    logger.d("[BackgroundFetch] Headless task timed-out: $taskId");
-    BackgroundFetch.finish(taskId);
-    return;
+void startCallback() {
+  // The setTaskHandler function must be called to handle the task in the background.
+  FlutterForegroundTask.setTaskHandler(MyTaskHandler());
+}
+
+class MyTaskHandler extends TaskHandler {
+  SendPort? _sendPort;
+  int _eventCount = 0;
+  StreamSubscription<StepCount>? _streamSubscription;
+
+  // Called when the task is started.
+  @override
+  void onStart(DateTime timestamp, SendPort? sendPort) async {
+    _streamSubscription = Pedometer.stepCountStream.listen((location) {
+      _eventCount = location.steps;
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'My Steps',
+        notificationText: '${location.steps}, ${location.timeStamp}',
+      );
+    });
+    _sendPort = sendPort;
+
+    _sendPort?.send(_eventCount);
+
+    // You can use the getData function to get the stored data.
+    final customData =
+        await FlutterForegroundTask.getData<String>(key: 'customData');
+    print('customData: $customData');
   }
-  logger.d("[BackgroundFetch] Headless event received: $taskId");
-  if (await checkActivityPermission()) {
-    // fetch first value from stream, this will automatically close the stream after that
-    logger.d("called before stream");
-    try {
-      int count = await fetchStepCount();
-      logger.d("total count is $count");
-      BackgroundFetch.finish(taskId);
-    } catch (e) {
-      BackgroundFetch.finish(taskId);
-    }
-  } else {
-    BackgroundFetch.finish(taskId);
+
+  // Called every [interval] milliseconds in [ForegroundTaskOptions].
+  @override
+  void onRepeatEvent(DateTime timestamp, SendPort? sendPort) async {
+    // FlutterForegroundTask.updateService(
+    //   notificationTitle: 'MyTaskHandler',
+    //   notificationText: 'eventCount: $_eventCount',
+    // );
+
+    // // Send data to the main isolate.
+    // sendPort?.send(_eventCount);
+
+    // _eventCount++;
+  }
+
+  // Called when the notification button on the Android platform is pressed.
+  @override
+  void onDestroy(DateTime timestamp, SendPort? sendPort) async {
+    print('onDestroy');
+    await _streamSubscription?.cancel();
+  }
+
+  // Called when the notification button on the Android platform is pressed.
+  @override
+  void onNotificationButtonPressed(String id) {
+    print('onNotificationButtonPressed >> $id');
+  }
+
+  // Called when the notification itself on the Android platform is pressed.
+  //
+  // "android.permission.SYSTEM_ALERT_WINDOW" permission must be granted for
+  // this function to be called.
+  @override
+  void onNotificationPressed() {
+    // Note that the app will only route to "/resume-route" when it is exited so
+    // it will usually be necessary to send a message through the send port to
+    // signal it to restore state when the app is already started.
+    FlutterForegroundTask.launchApp("/resume-route");
+    _sendPort?.send('onNotificationPressed');
   }
 }
 
-void listenPedometer() async {}
+class ExampleApp extends StatelessWidget {
+  const ExampleApp({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      initialRoute: '/',
+      routes: {
+        '/': (context) => const ExamplePage(),
+        '/resume-route': (context) => const ResumeRoutePage(),
+      },
+    );
+  }
+}
+
+class ExamplePage extends StatefulWidget {
+  const ExamplePage({Key? key}) : super(key: key);
+
+  @override
+  State<StatefulWidget> createState() => _ExamplePageState();
+}
+
+class _ExamplePageState extends State<ExamplePage> {
+  ReceivePort? _receivePort;
+
+  Future<void> _requestPermissionForAndroid() async {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    // "android.permission.SYSTEM_ALERT_WINDOW" permission must be granted for
+    // onNotificationPressed function to be called.
+    //
+    // When the notification is pressed while permission is denied,
+    // the onNotificationPressed function is not called and the app opens.
+    //
+    // If you do not use the onNotificationPressed or launchApp function,
+    // you do not need to write this code.
+    if (!await FlutterForegroundTask.canDrawOverlays) {
+      // This function requires `android.permission.SYSTEM_ALERT_WINDOW` permission.
+      await FlutterForegroundTask.openSystemAlertWindowSettings();
+    }
+
+    // Android 12 or higher, there are restrictions on starting a foreground service.
+    //
+    // To restart the service on device reboot or unexpected problem, you need to allow below permission.
+    if (!await FlutterForegroundTask.isIgnoringBatteryOptimizations) {
+      // This function requires `android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` permission.
+      await FlutterForegroundTask.requestIgnoreBatteryOptimization();
+    }
+
+    // Android 13 and higher, you need to allow notification permission to expose foreground service notification.
+    final NotificationPermission notificationPermissionStatus =
+        await FlutterForegroundTask.checkNotificationPermission();
+    if (notificationPermissionStatus != NotificationPermission.granted) {
+      await FlutterForegroundTask.requestNotificationPermission();
+    }
+  }
+
+  void _initForegroundTask() {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        id: 500,
+        channelId: 'foreground_service',
+        channelName: 'Foreground Service Notification',
+        channelDescription:
+            'This notification appears when the foreground service is running.',
+        channelImportance: NotificationChannelImportance.LOW,
+        priority: NotificationPriority.LOW,
+        iconData: const NotificationIconData(
+          resType: ResourceType.mipmap,
+          resPrefix: ResourcePrefix.ic,
+          name: 'launcher',
+          backgroundColor: Colors.orange,
+        ),
+        buttons: [
+          const NotificationButton(
+            id: 'sendButton',
+            text: 'Send',
+            textColor: Colors.orange,
+          ),
+          const NotificationButton(
+            id: 'testButton',
+            text: 'Test',
+            textColor: Colors.grey,
+          ),
+        ],
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(
+        showNotification: true,
+        playSound: false,
+      ),
+      foregroundTaskOptions: const ForegroundTaskOptions(
+        interval: 5000,
+        isOnceEvent: false,
+        autoRunOnBoot: true,
+        allowWakeLock: true,
+        allowWifiLock: true,
+      ),
+    );
+  }
+
+  Future<bool> _startForegroundTask() async {
+    // You can save data using the saveData function.
+    await FlutterForegroundTask.saveData(key: 'customData', value: 'hello');
+
+    // Register the receivePort before starting the service.
+    final ReceivePort? receivePort = FlutterForegroundTask.receivePort;
+    final bool isRegistered = _registerReceivePort(receivePort);
+    if (!isRegistered) {
+      print('Failed to register receivePort!');
+      return false;
+    }
+
+    if (await FlutterForegroundTask.isRunningService) {
+      return FlutterForegroundTask.restartService();
+    } else {
+      return FlutterForegroundTask.startService(
+        notificationTitle: 'Foreground Service is running',
+        notificationText: 'Tap to return to the app',
+        callback: startCallback,
+      );
+    }
+  }
+
+  Future<bool> _stopForegroundTask() {
+    return FlutterForegroundTask.stopService();
+  }
+
+  bool _registerReceivePort(ReceivePort? newReceivePort) {
+    if (newReceivePort == null) {
+      return false;
+    }
+
+    _closeReceivePort();
+
+    _receivePort = newReceivePort;
+    _receivePort?.listen((data) {
+      if (data is int) {
+        print('eventCount: $data');
+      } else if (data is String) {
+        if (data == 'onNotificationPressed') {
+          Navigator.of(context).pushNamed('/resume-route');
+        }
+      } else if (data is DateTime) {
+        print('timestamp: ${data.toString()}');
+      }
+    });
+
+    return _receivePort != null;
+  }
+
+  void _closeReceivePort() {
+    _receivePort?.close();
+    _receivePort = null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _requestPermissionForAndroid();
+      _initForegroundTask();
+
+      // You can get the previous ReceivePort without restarting the service.
+      if (await FlutterForegroundTask.isRunningService) {
+        final newReceivePort = FlutterForegroundTask.receivePort;
+        _registerReceivePort(newReceivePort);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _closeReceivePort();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // A widget that prevents the app from closing when the foreground service is running.
+    // This widget must be declared above the [Scaffold] widget.
+    return WithForegroundTask(
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Flutter Foreground Task'),
+          centerTitle: true,
+        ),
+        body: _buildContentView(),
+      ),
+    );
+  }
+
+  Widget _buildContentView() {
+    buttonBuilder(String text, {VoidCallback? onPressed}) {
+      return ElevatedButton(
+        onPressed: onPressed,
+        child: Text(text),
+      );
+    }
+
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          buttonBuilder('start', onPressed: _startForegroundTask),
+          buttonBuilder('stop', onPressed: _stopForegroundTask),
+        ],
+      ),
+    );
+  }
+}
+
+class ResumeRoutePage extends StatelessWidget {
+  const ResumeRoutePage({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Resume Route'),
+        centerTitle: true,
+      ),
+      body: Center(
+        child: ElevatedButton(
+          onPressed: () {
+            // Navigate back to first route when tapped.
+            Navigator.of(context).pop();
+          },
+          child: const Text('Go back!'),
+        ),
+      ),
+    );
+  }
+}
 
 Future<bool> checkActivityPermission() async {
   if (Platform.isAndroid) {
@@ -46,120 +326,4 @@ Future<bool> checkActivityPermission() async {
     return Permission.sensors.isGranted;
   }
   return false;
-}
-
-void main() {
-  runApp(MyApp());
-  BackgroundFetch.registerHeadlessTask(backgroundFetchHeadlessTask);
-}
-
-Future<int> fetchStepCount() async {
-  try {
-    final int stepCount = await platform.invokeMethod('getStepCount');
-    return stepCount;
-  } catch (e) {
-    print('Error fetching step count: $e');
-    return 0; // Handle errors appropriately
-  }
-}
-
-class MyApp extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      home: HomeScreen(),
-    );
-  }
-}
-
-class HomeScreen extends StatefulWidget {
-  @override
-  _HomeScreenState createState() => _HomeScreenState();
-}
-
-class _HomeScreenState extends State<HomeScreen> {
-  int stepCount = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    initPlatformState();
-    // fetchStepCount();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Step Count Monitor'),
-      ),
-      body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            FutureBuilder<int>(
-            future: fetchStepCount(),
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.waiting) {
-                return const CircularProgressIndicator();
-              } else if (snapshot.hasError) {
-                return Text('Error: ${snapshot.error}');
-              } else {
-                return Text('Step Count: ${snapshot.data}');
-              }
-            },
-          ),
-            Text(
-              '$stepCount',
-              style: const TextStyle(fontSize: 40, fontWeight: FontWeight.bold),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> initPlatformState() async {
-    // Configure BackgroundFetch.
-    // acitivityPermssion should be provided to
-    final PermissionStatus requestStatus =
-        await Permission.activityRecognition.request();
-
-    // if permission granted get step count
-    try {
-      var status = await BackgroundFetch.configure(
-          BackgroundFetchConfig(
-              minimumFetchInterval: 15,
-              forceAlarmManager: false,
-              stopOnTerminate: false,
-              startOnBoot: true,
-              enableHeadless: true,
-              requiresBatteryNotLow: false,
-              requiresCharging: false,
-              requiresStorageNotLow: false,
-              requiresDeviceIdle: false,
-              requiredNetworkType: NetworkType.NONE),
-          _onBackgroundFetch,
-          _onBackgroundFetchTimeout);
-      print(
-          '[BackgroundFetch] configure success: $status with ${DateTime.now()}');
-    } on Exception catch (e) {
-      print("[BackgroundFetch] configure ERROR: $e");
-    }
-  }
-
-  void _onBackgroundFetch(String taskId) async {
-    print("called background fetch method");
-    int count = await fetchStepCount();
-    logger.d("total count is $count");
-    // IMPORTANT:  You must signal completion of your fetch task or the OS can punish your app
-    // for taking too long in the background.
-    BackgroundFetch.finish(taskId);
-  }
-
-  /// This event fires shortly before your task is about to timeout.  You must finish any outstanding work and call BackgroundFetch.finish(taskId).
-  void _onBackgroundFetchTimeout(String taskId) {
-    print("[BackgroundFetch] TIMEOUT: $taskId");
-    BackgroundFetch.finish(taskId);
-  }
 }
